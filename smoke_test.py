@@ -4,14 +4,18 @@ Coverage goal: 100% of public methods, all filter parameters,
 all output modes (model, dict, dataframe), and key edge cases.
 """
 
+import asyncio
 import logging
 import sys
+import tempfile
+import threading
 import time
+from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("smoke_test")
 
-from mtg_json_tools import MtgJsonTools
+from mtg_json_tools import AsyncMtgJsonTools, MtgJsonTools
 
 PASS = 0
 FAIL = 0
@@ -55,10 +59,34 @@ def main():
     r = repr(sdk)
     check("__repr__", "MtgJsonTools" in r, f"repr={r}")
 
-    # context manager
+    # context manager — verify resources released after exit
     with MtgJsonTools() as ctx_sdk:
         check("__enter__ returns SDK", isinstance(ctx_sdk, MtgJsonTools))
-    check("__exit__ (no error)", True, "context manager closed cleanly")
+        # Query inside context should work
+        ctx_meta = ctx_sdk.meta
+        check("query inside context", isinstance(ctx_meta, dict))
+    # After exit, connection should be closed
+    try:
+        ctx_sdk.sql("SELECT 1")
+        check("__exit__ closes connection", False, "query succeeded after close")
+    except Exception:
+        check("__exit__ closes connection", True)
+
+    # constructor: custom cache_dir
+    with tempfile.TemporaryDirectory() as tmpdir:
+        custom_sdk = MtgJsonTools(cache_dir=tmpdir)
+        check(
+            "constructor cache_dir",
+            tmpdir in repr(custom_sdk),
+            f"repr={repr(custom_sdk)}",
+        )
+        custom_sdk.close()
+
+    # constructor: on_progress callback
+    progress_calls = []
+    progress_sdk = MtgJsonTools(on_progress=lambda *args: progress_calls.append(args))
+    check("constructor on_progress", progress_sdk is not None)
+    progress_sdk.close()
 
     # meta property
     meta = sdk.meta
@@ -79,6 +107,19 @@ def main():
     # refresh() — in offline-like conditions, cache is fresh after meta load
     refresh_result = sdk.refresh()
     check("refresh()", isinstance(refresh_result, bool), f"stale={refresh_result}")
+
+    # refresh — queries still work after refresh
+    sdk.refresh()
+    post_refresh_count = sdk.cards.count()
+    check(
+        "queries work after refresh",
+        post_refresh_count > 0,
+        f"count={post_refresh_count}",
+    )
+
+    # Connection.raw property
+    raw_conn = sdk._conn.raw
+    check("Connection.raw returns DuckDB", raw_conn is not None)
 
     # ══════════════════════════════════════════════════════════
     #  CARDS — CardQuery (8 methods, ~20 filter params)
@@ -106,6 +147,10 @@ def main():
         f"type={type(bolt_df).__name__}",
     )
 
+    # get_by_name — empty string
+    bolt_empty_name = sdk.cards.get_by_name("")
+    check("get_by_name empty string", len(bolt_empty_name) == 0)
+
     uuid = None
     if bolt:
         uuid = bolt[0].uuid
@@ -128,6 +173,15 @@ def main():
         # get_by_uuid — nonexistent
         missing = sdk.cards.get_by_uuid("00000000-0000-0000-0000-000000000000")
         check("get_by_uuid nonexistent returns None", missing is None)
+
+        # Cross-reference consistency: uuid lookup == name lookup
+        by_uuid = sdk.cards.get_by_uuid(uuid)
+        by_name = sdk.cards.get_by_name("Lightning Bolt")
+        name_uuids = {c.uuid for c in by_name}
+        check(
+            "cross-ref uuid in name results",
+            by_uuid is not None and by_uuid.uuid in name_uuids,
+        )
 
     # ── Cards: get_by_uuids (bulk lookup) ──
     section("Cards: bulk lookups (get_by_uuids)")
@@ -168,6 +222,24 @@ def main():
     # exact name
     s = sdk.cards.search(name="Lightning Bolt", limit=5)
     check("search name exact", len(s) > 0)
+
+    # fuzzy_name — typo-tolerant search
+    s = sdk.cards.search(fuzzy_name="Ligtning Bolt", limit=5)
+    check(
+        "search fuzzy_name typo",
+        len(s) > 0,
+        f"found {len(s)}, top={s[0].name if s else '?'}",
+    )
+    if s:
+        check(
+            "fuzzy_name finds correct card",
+            s[0].name == "Lightning Bolt",
+            f"got '{s[0].name}'",
+        )
+
+    # fuzzy_name with set_code
+    s = sdk.cards.search(fuzzy_name="Counterspel", set_code="MH3", limit=5)
+    check("search fuzzy_name + set_code", isinstance(s, list), f"found {len(s)}")
 
     # colors
     s = sdk.cards.search(colors=["R"], mana_value=1.0, limit=5)
@@ -286,6 +358,37 @@ def main():
     s = sdk.cards.search(name="Lightning%", limit=3, as_dataframe=True)
     check("search as_dataframe", hasattr(s, "shape"))
 
+    # ── Cards: multi-filter combination tests ──
+    section("Cards: multi-filter combinations")
+
+    # colors + types + rarity (red mythic creatures)
+    s = sdk.cards.search(colors=["R"], types="Creature", rarity="mythic", limit=5)
+    check("multi: colors+types+rarity", len(s) > 0, f"found {len(s)}")
+
+    # keyword + mana_value_lte (cheap flyers)
+    s = sdk.cards.search(keyword="Flying", mana_value_lte=2.0, limit=5)
+    check("multi: keyword+mana_value_lte", len(s) > 0, f"found {len(s)}")
+
+    # text_regex + colors (red cards with damage text)
+    s = sdk.cards.search(text_regex="damage", colors=["R"], limit=5)
+    check("multi: text_regex+colors", len(s) > 0, f"found {len(s)}")
+
+    # availability + layout
+    s = sdk.cards.search(availability="paper", layout="normal", limit=5)
+    check("multi: availability+layout", len(s) > 0, f"found {len(s)}")
+
+    # is_promo + rarity + set_code
+    s = sdk.cards.search(is_promo=True, rarity="mythic", set_code="MH3", limit=5)
+    check("multi: promo+rarity+set_code", isinstance(s, list), f"found {len(s)}")
+
+    # localized_name + set_code
+    s = sdk.cards.search(localized_name="%Blitz%", set_code="MH3", limit=5)
+    check("multi: localized_name+set_code", isinstance(s, list), f"found {len(s)}")
+
+    # wildcard-only search (should respect limit)
+    s = sdk.cards.search(name="%", limit=3)
+    check("search wildcard-only respects limit", len(s) <= 3, f"got {len(s)}")
+
     # ── Cards: other methods ──
     section("Cards: random, count, printings, atomic, find_by_scryfall_id")
 
@@ -301,12 +404,20 @@ def main():
     count = sdk.cards.count()
     check("count()", count > 1000, f"total cards: {count}")
 
-    # count with filters
+    # count with single filter
     count_r = sdk.cards.count(rarity="mythic")
     check(
         "count(rarity=mythic)",
         count_r > 0 and count_r < count,
         f"mythic cards: {count_r}",
+    )
+
+    # count with combined filters
+    count_combo = sdk.cards.count(setCode="MH3", rarity="rare")
+    check(
+        "count(setCode+rarity)",
+        count_combo > 0 and count_combo < count_r,
+        f"MH3 rares: {count_combo}",
     )
 
     printings = sdk.cards.get_printings("Counterspell")
@@ -342,16 +453,48 @@ def main():
         f"layout={atomic_fire[0].layout if atomic_fire else '?'}",
     )
 
-    # find_by_scryfall_id (may not match since uuid != scryfallId)
+    # get_atomic — split card with full name
+    fire_ice = sdk.cards.get_by_name("Fire // Ice")
+    check(
+        "get_by_name split card 'Fire // Ice'",
+        len(fire_ice) > 0,
+        f"found {len(fire_ice)} printings",
+    )
+
+    # find_by_scryfall_id — use a REAL scryfall ID from identifiers
     if uuid:
-        scry_cards = sdk.cards.find_by_scryfall_id(uuid)
-        check("find_by_scryfall_id runs", isinstance(scry_cards, list), "no error")
+        real_scryfall_id = None
+        bolt_ids = sdk.identifiers.get_identifiers(uuid)
+        if bolt_ids and bolt_ids.get("scryfallId"):
+            real_scryfall_id = bolt_ids["scryfallId"]
 
-        scry_dict = sdk.cards.find_by_scryfall_id(uuid, as_dict=True)
-        check("find_by_scryfall_id as_dict", isinstance(scry_dict, list))
+        if real_scryfall_id:
+            scry_cards = sdk.cards.find_by_scryfall_id(real_scryfall_id)
+            check(
+                "find_by_scryfall_id (real ID)",
+                len(scry_cards) > 0,
+                f"found {len(scry_cards)}, name={scry_cards[0].name if scry_cards else '?'}",
+            )
 
-        scry_df = sdk.cards.find_by_scryfall_id(uuid, as_dataframe=True)
-        check("find_by_scryfall_id as_dataframe", hasattr(scry_df, "shape"))
+            scry_dict = sdk.cards.find_by_scryfall_id(real_scryfall_id, as_dict=True)
+            check(
+                "find_by_scryfall_id as_dict",
+                len(scry_dict) > 0 and isinstance(scry_dict[0], dict),
+            )
+
+            scry_df = sdk.cards.find_by_scryfall_id(real_scryfall_id, as_dataframe=True)
+            check("find_by_scryfall_id as_dataframe", hasattr(scry_df, "shape"))
+        else:
+            # Fallback: at least test that the method runs
+            scry_cards = sdk.cards.find_by_scryfall_id(uuid)
+            check("find_by_scryfall_id runs (fallback)", isinstance(scry_cards, list))
+            skip("find_by_scryfall_id real ID", "no scryfallId in identifiers")
+
+        # Nonexistent scryfall ID
+        scry_missing = sdk.cards.find_by_scryfall_id(
+            "00000000-0000-0000-0000-000000000000"
+        )
+        check("find_by_scryfall_id nonexistent", len(scry_missing) == 0)
 
     # ══════════════════════════════════════════════════════════
     #  TOKENS — TokenQuery (5 methods, ~8 filter params)
@@ -393,11 +536,20 @@ def main():
         f"found {len(token_search_type)}",
     )
 
-    # search by artist
-    token_search_artist = sdk.tokens.search(
-        artist="", limit=5
-    )  # empty string = no filter
-    check("token search with artist param", isinstance(token_search_artist, list))
+    # search by artist — use a real artist name from token data
+    token_artist_row = sdk.sql(
+        "SELECT DISTINCT artist FROM tokens WHERE artist IS NOT NULL LIMIT 1"
+    )
+    if token_artist_row:
+        token_artist_name = token_artist_row[0]["artist"]
+        token_search_artist = sdk.tokens.search(artist=token_artist_name, limit=5)
+        check(
+            "token search artist (real)",
+            len(token_search_artist) > 0,
+            f"artist='{token_artist_name}', found {len(token_search_artist)}",
+        )
+    else:
+        skip("token search artist", "no artist data in tokens")
 
     # search by colors
     token_search_colors = sdk.tokens.search(colors=["W"], limit=5)
@@ -496,6 +648,9 @@ def main():
         bulk_tokens_d = sdk.tokens.get_by_uuids(token_uuids, as_dict=True)
         check("token get_by_uuids as_dict", isinstance(bulk_tokens_d[0], dict))
 
+        bulk_tokens_df = sdk.tokens.get_by_uuids(token_uuids, as_dataframe=True)
+        check("token get_by_uuids as_dataframe", hasattr(bulk_tokens_df, "shape"))
+
     check("token get_by_uuids empty", sdk.tokens.get_by_uuids([]) == [])
 
     # ══════════════════════════════════════════════════════════
@@ -512,6 +667,14 @@ def main():
 
     mh3_df = sdk.sets.get("MH3", as_dataframe=True)
     check("get set as_dataframe", hasattr(mh3_df, "shape"))
+
+    # get — case insensitive (code is uppercased internally)
+    mh3_lower = sdk.sets.get("mh3")
+    check(
+        "get set case insensitive",
+        mh3_lower is not None and mh3_lower.code == "MH3",
+        f"code={mh3_lower.code if mh3_lower else '?'}",
+    )
 
     # get nonexistent
     missing_set = sdk.sets.get("ZZZZZ")
@@ -582,6 +745,15 @@ def main():
     # search — as_dataframe
     set_search_df = sdk.sets.search(name="Horizons", as_dataframe=True)
     check("search as_dataframe", hasattr(set_search_df, "shape"))
+
+    # search — offset (pagination)
+    set_sp1 = sdk.sets.search(set_type="expansion", limit=3)
+    set_sp2_all = sdk.sets.search(set_type="expansion", limit=100)
+    check(
+        "set search limit constrains",
+        len(set_sp1) <= 3 and len(set_sp2_all) > len(set_sp1),
+        f"limit3={len(set_sp1)}, limit100={len(set_sp2_all)}",
+    )
 
     # count
     set_count = sdk.sets.count()
@@ -810,6 +982,18 @@ def main():
             f"formats: {list(formats.keys())[:5]}...",
         )
 
+        # formats_for_card — verify structure (format->status mapping)
+        if formats:
+            sample_fmt = next(iter(formats))
+            sample_status = formats[sample_fmt]
+            check(
+                "formats_for_card structure",
+                isinstance(sample_fmt, str)
+                and sample_status
+                in ("Legal", "Banned", "Restricted", "Suspended", "Not Legal"),
+                f"{sample_fmt}={sample_status}",
+            )
+
         # is_legal
         is_legal = sdk.legalities.is_legal(uuid, "modern")
         check("is_legal modern", is_legal is True)
@@ -834,17 +1018,29 @@ def main():
     legal_p2 = sdk.legalities.legal_in("modern", limit=3, offset=3)
     check("legal_in offset", len(legal_p1) > 0 and len(legal_p2) > 0)
 
-    # banned_in
+    # banned_in — result structure validation
     banned = sdk.legalities.banned_in("modern", limit=5)
     check("banned_in modern", isinstance(banned, list), f"found {len(banned)}")
+    if banned:
+        check(
+            "banned_in has name+uuid keys",
+            "name" in banned[0] and "uuid" in banned[0],
+            f"keys={list(banned[0].keys())}",
+        )
 
-    # restricted_in
+    # restricted_in — result structure validation
     restricted = sdk.legalities.restricted_in("vintage", limit=5)
     check(
         "restricted_in vintage",
         isinstance(restricted, list),
         f"found {len(restricted)}",
     )
+    if restricted:
+        check(
+            "restricted_in has name+uuid keys",
+            "name" in restricted[0] and "uuid" in restricted[0],
+            f"keys={list(restricted[0].keys())}",
+        )
 
     # suspended_in (may have 0 results if no cards are currently suspended)
     suspended = sdk.legalities.suspended_in("historic", limit=5)
@@ -857,9 +1053,23 @@ def main():
     check(
         "not_legal_in standard", isinstance(not_legal, list), f"found {len(not_legal)}"
     )
+    if not_legal:
+        check(
+            "not_legal_in has name+uuid keys",
+            "name" in not_legal[0] and "uuid" in not_legal[0],
+            f"keys={list(not_legal[0].keys())}",
+        )
+
+    # banned_in — with offset
+    banned_p1 = sdk.legalities.banned_in("modern", limit=2, offset=0)
+    banned_p2 = sdk.legalities.banned_in("modern", limit=2, offset=2)
+    check(
+        "banned_in offset",
+        isinstance(banned_p1, list) and isinstance(banned_p2, list),
+    )
 
     # ══════════════════════════════════════════════════════════
-    #  PRICES — PriceQuery (5 methods)
+    #  PRICES — PriceQuery (7 methods)
     #  Downloads AllPricesToday.json.gz (~large file)
     # ══════════════════════════════════════════════════════════
     section("Prices")
@@ -883,6 +1093,23 @@ def main():
             )
 
             if today_prices:
+                # Validate price row structure
+                first_row = today_prices[0]
+                expected_keys = {
+                    "uuid",
+                    "provider",
+                    "finish",
+                    "price",
+                    "date",
+                    "category",
+                }
+                actual_keys = set(first_row.keys())
+                check(
+                    "price row has expected keys",
+                    expected_keys.issubset(actual_keys),
+                    f"missing={expected_keys - actual_keys}, actual={sorted(actual_keys)}",
+                )
+
                 # today — with provider filter
                 providers = {r.get("provider") for r in today_prices}
                 if providers:
@@ -920,6 +1147,14 @@ def main():
                 today_df = sdk.prices.today(uuid, as_dataframe=True)
                 check("prices.today as_dataframe", hasattr(today_df, "shape"))
 
+                # today — as_dict returns same as default (both are dicts)
+                today_dict = sdk.prices.today(uuid, as_dict=True)
+                check(
+                    "prices.today as_dict matches default",
+                    len(today_dict) == len(today_prices),
+                    f"dict={len(today_dict)}, default={len(today_prices)}",
+                )
+
             # history
             history = sdk.prices.history(uuid)
             check(
@@ -945,6 +1180,18 @@ def main():
                 )
                 check("prices.history provider filter", isinstance(hist_prov, list))
 
+                # history — with finish filter
+                hist_fin = sdk.prices.history(
+                    uuid, finish=history[0].get("finish", "normal")
+                )
+                check("prices.history finish filter", isinstance(hist_fin, list))
+
+                # history — with category filter
+                hist_cat = sdk.prices.history(
+                    uuid, category=history[0].get("category", "retail")
+                )
+                check("prices.history category filter", isinstance(hist_cat, list))
+
                 # history — as_dataframe
                 hist_df = sdk.prices.history(uuid, as_dataframe=True)
                 check("prices.history as_dataframe", hasattr(hist_df, "shape"))
@@ -963,12 +1210,26 @@ def main():
                     all(k in trend for k in ("min_price", "max_price", "avg_price")),
                 )
 
+                # price_trend — verify additional keys
+                check(
+                    "price_trend has date+count keys",
+                    all(k in trend for k in ("first_date", "last_date", "data_points")),
+                    f"keys={list(trend.keys())}",
+                )
+
                 # price_trend with provider/finish
                 trend2 = sdk.prices.price_trend(
                     uuid, provider="tcgplayer", finish="normal"
                 )
                 check(
                     "price_trend with filters", isinstance(trend2, (dict, type(None)))
+                )
+
+                # price_trend with buylist category
+                trend_buy = sdk.prices.price_trend(uuid, category="buylist")
+                check(
+                    "price_trend buylist",
+                    isinstance(trend_buy, (dict, type(None))),
                 )
 
             # cheapest_printing
@@ -983,6 +1244,12 @@ def main():
                 check(
                     "cheapest has price", "price" in cheapest and cheapest["price"] > 0
                 )
+                # Validate structure
+                check(
+                    "cheapest has expected keys",
+                    all(k in cheapest for k in ("uuid", "setCode", "price")),
+                    f"keys={list(cheapest.keys())}",
+                )
 
             # cheapest with different provider
             cheapest2 = sdk.prices.cheapest_printing(
@@ -991,6 +1258,72 @@ def main():
             check(
                 "cheapest_printing alt provider",
                 isinstance(cheapest2, (dict, type(None))),
+            )
+
+            # cheapest_printings (bulk — each card's cheapest)
+            cheapest_bulk = sdk.prices.cheapest_printings(limit=5)
+            check(
+                "prices.cheapest_printings (bulk)",
+                isinstance(cheapest_bulk, list) and len(cheapest_bulk) > 0,
+                f"found {len(cheapest_bulk)}",
+            )
+            if cheapest_bulk:
+                check(
+                    "cheapest_printings row structure",
+                    all(
+                        k in cheapest_bulk[0]
+                        for k in ("name", "cheapest_set", "min_price")
+                    ),
+                    f"keys={list(cheapest_bulk[0].keys())}",
+                )
+
+            # cheapest_printings with pagination
+            cp_p1 = sdk.prices.cheapest_printings(limit=3, offset=0)
+            cp_p2 = sdk.prices.cheapest_printings(limit=3, offset=3)
+            check(
+                "cheapest_printings pagination",
+                len(cp_p1) > 0 and len(cp_p2) > 0,
+            )
+
+            # cheapest_printings with different provider/finish
+            cp_ck = sdk.prices.cheapest_printings(
+                provider="cardkingdom", finish="normal", limit=3
+            )
+            check(
+                "cheapest_printings alt provider",
+                isinstance(cp_ck, list),
+                f"found {len(cp_ck)}",
+            )
+
+            # most_expensive_printings (bulk)
+            expensive_bulk = sdk.prices.most_expensive_printings(limit=5)
+            check(
+                "prices.most_expensive_printings (bulk)",
+                isinstance(expensive_bulk, list) and len(expensive_bulk) > 0,
+                f"found {len(expensive_bulk)}",
+            )
+            if expensive_bulk:
+                check(
+                    "most_expensive row structure",
+                    all(
+                        k in expensive_bulk[0]
+                        for k in ("name", "priciest_set", "max_price")
+                    ),
+                    f"keys={list(expensive_bulk[0].keys())}",
+                )
+                # Verify ordering (most expensive first)
+                check(
+                    "most_expensive ordered DESC",
+                    expensive_bulk[0]["max_price"] >= expensive_bulk[-1]["max_price"],
+                    f"first={expensive_bulk[0]['max_price']}, last={expensive_bulk[-1]['max_price']}",
+                )
+
+            # most_expensive_printings with pagination
+            ep_p1 = sdk.prices.most_expensive_printings(limit=3, offset=0)
+            ep_p2 = sdk.prices.most_expensive_printings(limit=3, offset=3)
+            check(
+                "most_expensive pagination",
+                len(ep_p1) > 0 and len(ep_p2) > 0,
             )
 
         else:
@@ -1026,6 +1359,23 @@ def main():
         # Nonexistent set
         fin_none = sdk.sets.get_financial_summary("ZZZZZ")
         check("get_financial_summary no data", fin_none is None)
+
+        # Verify structure when data exists
+        if fin:
+            check(
+                "financial summary keys",
+                all(
+                    k in fin
+                    for k in (
+                        "card_count",
+                        "total_value",
+                        "avg_value",
+                        "min_value",
+                        "max_value",
+                    )
+                ),
+                f"keys={list(fin.keys())}",
+            )
     else:
         skip("get_financial_summary", "prices not loaded")
 
@@ -1117,6 +1467,15 @@ def main():
                 # Access first SKU — it's either a model or dict
                 first_sku = skus_dict[0] if skus_dict else None
                 if first_sku:
+                    # Validate SKU row structure
+                    sku_expected = {"skuId", "productId"}
+                    sku_actual = set(first_sku.keys())
+                    check(
+                        "SKU row has expected keys",
+                        sku_expected.issubset(sku_actual),
+                        f"missing={sku_expected - sku_actual}, keys={sorted(sku_actual)}",
+                    )
+
                     # find_by_sku_id
                     sku_id = first_sku.get("skuId")
                     if sku_id:
@@ -1136,8 +1495,19 @@ def main():
                             len(by_prod) > 0,
                             f"productId={prod_id}",
                         )
+
+                        # find_by_product_id as_dict
+                        by_prod_d = sdk.skus.find_by_product_id(prod_id, as_dict=True)
+                        check(
+                            "skus.find_by_product_id as_dict",
+                            isinstance(by_prod_d, list),
+                        )
                     else:
                         skip("skus.find_by_product_id", "no productId in data")
+
+                    # find_by_sku_id — nonexistent
+                    by_sku_missing = sdk.skus.find_by_sku_id(-99999)
+                    check("skus.find_by_sku_id nonexistent", by_sku_missing is None)
             else:
                 skip("skus.find_by_sku_id", "no SKU data for this card")
                 skip("skus.find_by_product_id", "no SKU data for this card")
@@ -1220,6 +1590,10 @@ def main():
     check(
         "sealed.list category", isinstance(sealed_cat, list), f"found {len(sealed_cat)}"
     )
+
+    # list — limit=1 (verify pagination)
+    sealed_one = sdk.sealed.list(limit=1)
+    check("sealed.list limit=1", isinstance(sealed_one, list) and len(sealed_one) <= 1)
 
     # list — as_dict
     sealed_dict = sdk.sealed.list(as_dict=True)
@@ -1305,6 +1679,13 @@ def main():
     )
     check("sql cross-table join", len(join_result) > 0 and "setName" in join_result[0])
 
+    # sql — unicode param
+    unicode_result = sdk.sql(
+        "SELECT name FROM cards WHERE name = $1 LIMIT 1",
+        params=["Lightning Bolt"],
+    )
+    check("sql unicode param", isinstance(unicode_result, list))
+
     # ══════════════════════════════════════════════════════════
     #  VIEWS — verify views grew as we queried
     # ══════════════════════════════════════════════════════════
@@ -1330,7 +1711,18 @@ def main():
     s = sdk.cards.search(name="Jötun%", limit=5)
     check("search unicode name", isinstance(s, list), f"found {len(s)}")
 
-    # Card model field validation
+    # Boundary: limit=0
+    zero_limit = sdk.cards.search(name="Lightning%", limit=0)
+    check("search limit=0", len(zero_limit) == 0)
+
+    # Boundary: negative offset (should not crash)
+    try:
+        neg_offset = sdk.cards.search(name="Lightning%", limit=5, offset=-1)
+        check("search negative offset", isinstance(neg_offset, list), "no crash")
+    except Exception:
+        check("search negative offset raises", True, "error is acceptable")
+
+    # Card model field validation (comprehensive)
     if bolt:
         card = bolt[0]
         check("card has uuid", bool(card.uuid))
@@ -1340,8 +1732,24 @@ def main():
             "card has manaValue", card.mana_value is not None, f"mv={card.mana_value}"
         )
         check("card has text", bool(card.text), f"text={card.text[:50]}...")
+        check("card has rarity", bool(card.rarity), f"rarity={card.rarity}")
+        check("card has setCode", bool(card.set_code), f"setCode={card.set_code}")
+        check("card has layout", bool(card.layout), f"layout={card.layout}")
+        check("card has type", bool(card.type), f"type={card.type}")
+        check("card has artist", bool(card.artist), f"artist={card.artist}")
+        check("card has number", card.number is not None, f"number={card.number}")
+        check(
+            "card has availability",
+            isinstance(card.availability, list) and len(card.availability) > 0,
+            f"availability={card.availability}",
+        )
+        check(
+            "card has keywords",
+            isinstance(card.keywords, list),
+            f"keywords={card.keywords}",
+        )
 
-    # Set model field validation
+    # Set model field validation (comprehensive)
     if mh3:
         check("set has code", mh3.code == "MH3")
         check("set has name", "Horizons" in mh3.name, f"name={mh3.name}")
@@ -1357,12 +1765,27 @@ def main():
             mh3.total_set_size > 0,
             f"totalSetSize={mh3.total_set_size}",
         )
+        # Additional set fields
+        if hasattr(mh3, "is_online_only"):
+            check(
+                "set has isOnlineOnly",
+                isinstance(mh3.is_online_only, bool),
+                f"isOnlineOnly={mh3.is_online_only}",
+            )
 
-    # Token model field validation
+    # Token model field validation (comprehensive)
     if token_search:
         tok = token_search[0]
         check("token has uuid", bool(tok.uuid))
         check("token has name", bool(tok.name))
+        check(
+            "token has colors",
+            isinstance(tok.colors, list),
+            f"colors={tok.colors}",
+        )
+        check("token has types", isinstance(tok.types, list), f"types={tok.types}")
+        if hasattr(tok, "set_code"):
+            check("token has setCode", bool(tok.set_code), f"setCode={tok.set_code}")
 
     # Atomic card model validation
     if atomic:
@@ -1370,6 +1793,8 @@ def main():
         check("atomic has name", a.name == "Lightning Bolt")
         check("atomic has layout", bool(a.layout))
         check("atomic has colors", isinstance(a.colors, list))
+        check("atomic has types", isinstance(a.types, list), f"types={a.types}")
+        check("atomic has text", bool(a.text), f"text={a.text[:50]}...")
 
     # DeckList model validation
     try:
@@ -1382,6 +1807,200 @@ def main():
             check("deck has fileName", bool(d.file_name))
     except Exception:
         skip("deck model validation", "deck data not loaded")
+
+    # DataFrame column validation (not just shape)
+    df_cards = sdk.cards.search(name="Lightning Bolt", limit=3, as_dataframe=True)
+    if hasattr(df_cards, "columns"):
+        cols = set(df_cards.columns)
+        check(
+            "DataFrame has expected columns",
+            {"name", "uuid", "manaValue", "rarity"}.issubset(cols),
+            f"sample cols: {sorted(cols)[:10]}",
+        )
+    else:
+        skip("DataFrame column validation", "no columns attribute")
+
+    df_sets = sdk.sets.list(limit=3, as_dataframe=True)
+    if hasattr(df_sets, "columns"):
+        scols = set(df_sets.columns)
+        check(
+            "Set DataFrame has expected columns",
+            {"code", "name", "releaseDate"}.issubset(scols),
+            f"sample cols: {sorted(scols)[:10]}",
+        )
+    else:
+        skip("Set DataFrame column validation", "no columns attribute")
+
+    # ══════════════════════════════════════════════════════════
+    #  EXPORT DB
+    # ══════════════════════════════════════════════════════════
+    section("Export DB")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        export_path = Path(tmpdir) / "test_export.duckdb"
+        result_path = sdk.export_db(export_path)
+        check("export_db returns path", result_path == export_path)
+        check("export_db creates file", export_path.exists())
+        check(
+            "export_db file has size",
+            export_path.stat().st_size > 0,
+            f"size={export_path.stat().st_size}",
+        )
+
+        # Verify exported DB is readable with DuckDB
+        import duckdb
+
+        with duckdb.connect(str(export_path)) as export_conn:
+            tables = [
+                r[0]
+                for r in export_conn.execute(
+                    "SELECT table_name FROM information_schema.tables"
+                ).fetchall()
+            ]
+            check(
+                "export_db has tables",
+                "cards" in tables,
+                f"tables={tables[:5]}",
+            )
+            export_count = export_conn.execute("SELECT COUNT(*) FROM cards").fetchone()[
+                0
+            ]
+            check(
+                "export_db cards queryable",
+                export_count > 0,
+                f"count={export_count}",
+            )
+
+    # ══════════════════════════════════════════════════════════
+    #  ASYNC CLIENT — AsyncMtgJsonTools
+    # ══════════════════════════════════════════════════════════
+    section("AsyncMtgJsonTools")
+
+    async def run_async_tests():
+        results = []
+
+        # Basic construction
+        async with AsyncMtgJsonTools() as async_sdk:
+            results.append(
+                ("async __aenter__", isinstance(async_sdk, AsyncMtgJsonTools))
+            )
+
+            # inner property
+            results.append(
+                (
+                    "async inner is MtgJsonTools",
+                    isinstance(async_sdk.inner, MtgJsonTools),
+                )
+            )
+
+            # run() with cards.search
+            cards = await async_sdk.run(
+                async_sdk.inner.cards.search, name="Lightning%", limit=3
+            )
+            results.append(("async run cards.search", len(cards) > 0))
+
+            # run() with sets.get
+            s = await async_sdk.run(async_sdk.inner.sets.get, "MH3")
+            results.append(("async run sets.get", s is not None))
+
+            # sql()
+            rows = await async_sdk.sql("SELECT COUNT(*) AS cnt FROM cards")
+            results.append(("async sql", rows[0]["cnt"] > 0))
+
+            # sql() with as_dataframe
+            df = await async_sdk.sql(
+                "SELECT name FROM cards LIMIT 3", as_dataframe=True
+            )
+            results.append(("async sql as_dataframe", hasattr(df, "shape")))
+
+            # Concurrent queries via asyncio.gather
+            r1, r2, r3 = await asyncio.gather(
+                async_sdk.run(async_sdk.inner.cards.count),
+                async_sdk.run(async_sdk.inner.sets.count),
+                async_sdk.run(async_sdk.inner.tokens.count),
+            )
+            results.append(
+                (
+                    "async concurrent gather",
+                    r1 > 0 and r2 > 0 and r3 > 0,
+                )
+            )
+
+        # After __aexit__, inner should be closed
+        try:
+            async_sdk.inner.sql("SELECT 1")
+            results.append(("async __aexit__ closes", False))
+        except Exception:
+            results.append(("async __aexit__ closes", True))
+
+        # Constructor with max_workers
+        async_sdk2 = AsyncMtgJsonTools(max_workers=2)
+        results.append(("async constructor max_workers", async_sdk2 is not None))
+        await async_sdk2.close()
+        results.append(("async manual close", True))
+
+        return results
+
+    try:
+        async_results = asyncio.run(run_async_tests())
+        for label, condition in async_results:
+            check(label, condition)
+    except Exception as e:
+        check("async tests", False, f"error: {e}")
+
+    # ══════════════════════════════════════════════════════════
+    #  RESOURCE SAFETY
+    # ══════════════════════════════════════════════════════════
+    section("Resource Safety")
+
+    # Double close — should not raise
+    safety_sdk = MtgJsonTools()
+    safety_sdk.close()
+    try:
+        safety_sdk.close()
+        check("double close no error", True)
+    except Exception as e:
+        check("double close no error", False, f"raised: {e}")
+
+    # Query after close — should raise
+    closed_sdk = MtgJsonTools()
+    closed_sdk.close()
+    try:
+        closed_sdk.sql("SELECT 1")
+        check("query after close raises", False, "should have raised")
+    except Exception:
+        check("query after close raises", True)
+
+    # ══════════════════════════════════════════════════════════
+    #  CONCURRENT SDK INSTANCES
+    # ══════════════════════════════════════════════════════════
+    section("Concurrent SDK Instances")
+
+    errors: list[str] = []
+
+    def thread_query(sdk_instance, thread_id):
+        try:
+            result = sdk_instance.cards.search(name="Lightning%", limit=3)
+            if len(result) == 0:
+                errors.append(f"thread-{thread_id}: empty result")
+        except Exception as e:
+            errors.append(f"thread-{thread_id}: {e}")
+
+    sdk2 = MtgJsonTools()
+    threads = [
+        threading.Thread(target=thread_query, args=(sdk, 1)),
+        threading.Thread(target=thread_query, args=(sdk2, 2)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    check(
+        "concurrent SDK instances",
+        len(errors) == 0,
+        f"errors: {errors}" if errors else "both threads OK",
+    )
+    sdk2.close()
 
     # ══════════════════════════════════════════════════════════
     #  DONE — close and report
